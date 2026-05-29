@@ -23,6 +23,16 @@ crons = ["*/5 * * * *"]
 # AI Gateway Shadow AI polling
 # wrangler secret put CF_AI_GATEWAY_ID
 
+# ── Governance KV namespace ───────────────────────────────────────────────
+# Create it first: wrangler kv namespace create GOV_KV
+# Then paste the id below
+[[kv_namespaces]]
+binding = "GOV_KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# ── Secret: GOV_ADMIN_SECRET ──────────────────────────────────────────────
+# wrangler secret put GOV_ADMIN_SECRET
+
 # ── Route — update to your domain ─────────────────────────────────────────
 # [[routes]]
 # pattern = "security-ingest.yourdomain.com/*"

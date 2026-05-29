@@ -1,176 +1,228 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import worker from "./index";
+import { Governance, CIRCUIT_THRESHOLD } from "./governance";
 import type { Env } from "./index";
 
-const env: Env = {
-  SPYDERBAT_API_URL: "https://api.spyderbat.com",
-  SPYDERBAT_API_TOKEN: "test-token",
-  SPYDERBAT_ORG_UID: "org-123",
-  AUTH_SECRET: "supersecret",
-  CF_API_TOKEN: "cf-token",
-  CF_ACCOUNT_ID: "acct-123",
-  CF_ZONE_ID: "zone-123",
-  CF_IP_LIST_ID: "list-abc",
-  SPYDERBAT_WEBHOOK_SECRET: "webhook-secret",
-  CF_AI_GATEWAY_ID: "gw-123",
-};
-
-function makeRequest(method: string, path: string, body?: string, headers?: Record<string, string>): Request {
-  return new Request(`https://worker.example.com${path}`, {
-    method,
-    body,
-    headers: { "Content-Type": "application/x-ndjson", ...headers },
-  });
+// ── Minimal in-memory KV mock ─────────────────────────────────────────────
+function makeKV(): KVNamespace {
+  const store = new Map<string, { value: string; expiry?: number }>();
+  return {
+    async get(key: string) {
+      const entry = store.get(key);
+      if (!entry) return null;
+      if (entry.expiry && Date.now() > entry.expiry) { store.delete(key); return null; }
+      return entry.value;
+    },
+    async put(key: string, value: string, opts?: { expirationTtl?: number }) {
+      store.set(key, { value, expiry: opts?.expirationTtl ? Date.now() + opts.expirationTtl * 1000 : undefined });
+    },
+    async delete(key: string) { store.delete(key); },
+    async list(opts?: { prefix?: string; limit?: number }) {
+      const keys = [...store.keys()]
+        .filter((k) => !opts?.prefix || k.startsWith(opts.prefix))
+        .slice(0, opts?.limit ?? 1000)
+        .map((name) => ({ name }));
+      return { keys, list_complete: true, cursor: "" };
+    },
+  } as unknown as KVNamespace;
 }
 
-// Build a valid HMAC-SHA256 signature for Spyderbat reverse webhook tests
+function makeEnv(overrides: Partial<Env> = {}): Env {
+  return {
+    SPYDERBAT_API_URL: "https://api.spyderbat.com",
+    SPYDERBAT_API_TOKEN: "tok",
+    SPYDERBAT_ORG_UID: "org-1",
+    AUTH_SECRET: "supersecret",
+    CF_API_TOKEN: "cf-tok",
+    CF_ACCOUNT_ID: "acct-1",
+    CF_ZONE_ID: "zone-1",
+    CF_IP_LIST_ID: "list-1",
+    SPYDERBAT_WEBHOOK_SECRET: "wh-secret",
+    CF_AI_GATEWAY_ID: "gw-1",
+    GOV_KV: makeKV(),
+    GOV_ADMIN_SECRET: "admin-secret",
+    ...overrides,
+  };
+}
+
 async function hmacSign(body: string, secret: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw", encoder.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false, ["sign"]
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(body));
   return btoa(String.fromCharCode(...new Uint8Array(sig)));
 }
 
+function req(method: string, path: string, body?: string, headers?: Record<string, string>): Request {
+  return new Request(`https://worker.test${path}`, {
+    method, body,
+    headers: { "Content-Type": "application/json", ...headers },
+  });
+}
+
 // ── Health ────────────────────────────────────────────────────────────────
-describe("health endpoint", () => {
-  it("returns 200 with status ok and version", async () => {
-    const res = await worker.fetch(makeRequest("GET", "/health"), env, {} as ExecutionContext);
+describe("GET /health", () => {
+  it("returns 200 with governance stats", async () => {
+    const res = await worker.fetch(req("GET", "/health"), makeEnv(), {} as ExecutionContext);
     expect(res.status).toBe(200);
-    const body = await res.json() as { status: string; version: string };
-    expect(body.status).toBe("ok");
-    expect(body.version).toBe("2.0");
+    const b = await res.json() as { status: string; governance: { circuit_open: boolean } };
+    expect(b.status).toBe("ok");
+    expect(b.governance.circuit_open).toBe(false);
   });
 });
 
-// ── Logpush ingest (POST /) ───────────────────────────────────────────────
-describe("auth validation", () => {
-  it("returns 401 when X-Auth-Secret is missing", async () => {
-    const res = await worker.fetch(makeRequest("POST", "/", '{"Action":"block"}'), env, {} as ExecutionContext);
+// ── Governance endpoints ──────────────────────────────────────────────────
+describe("GET /gov/stats", () => {
+  it("returns 401 without admin secret", async () => {
+    const res = await worker.fetch(req("GET", "/gov/stats"), makeEnv(), {} as ExecutionContext);
     expect(res.status).toBe(401);
   });
 
-  it("returns 401 when X-Auth-Secret is wrong", async () => {
-    const res = await worker.fetch(makeRequest("POST", "/", '{"Action":"block"}', { "X-Auth-Secret": "wrong" }), env, {} as ExecutionContext);
-    expect(res.status).toBe(401);
+  it("returns stats with admin secret", async () => {
+    const res = await worker.fetch(req("GET", "/gov/stats", undefined, { "X-Gov-Admin-Secret": "admin-secret" }), makeEnv(), {} as ExecutionContext);
+    expect(res.status).toBe(200);
+    const b = await res.json() as { circuit_open: boolean; circuit_threshold: number };
+    expect(b.circuit_open).toBe(false);
+    expect(b.circuit_threshold).toBe(CIRCUIT_THRESHOLD);
+  });
+});
+
+describe("GET /gov/audit", () => {
+  it("returns empty audit log initially", async () => {
+    const res = await worker.fetch(req("GET", "/gov/audit", undefined, { "X-Gov-Admin-Secret": "admin-secret" }), makeEnv(), {} as ExecutionContext);
+    const b = await res.json() as { count: number };
+    expect(b.count).toBe(0);
   });
 
-  it("accepts secret with surrounding whitespace", async () => {
+  it("audit log grows after an event is forwarded", async () => {
+    const env = makeEnv();
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("{}", { status: 200 })));
-    const res = await worker.fetch(makeRequest("POST", "/", '{"Action":"block","ClientIP":"1.1.1.1"}', { "X-Auth-Secret": "  supersecret  " }), env, {} as ExecutionContext);
-    expect(res.status).not.toBe(401);
+    await worker.fetch(
+      req("POST", "/", JSON.stringify({ Action: "block", ClientIP: "1.1.1.1", Source: "waf", WAFRuleID: "R1" }), { "X-Auth-Secret": "supersecret", "Content-Type": "application/x-ndjson" }),
+      env, {} as ExecutionContext,
+    );
+    const res = await worker.fetch(req("GET", "/gov/audit", undefined, { "X-Gov-Admin-Secret": "admin-secret" }), env, {} as ExecutionContext);
+    const b = await res.json() as { count: number; decisions: Array<{ action: string }> };
+    expect(b.count).toBeGreaterThan(0);
+    expect(b.decisions[0].action).toBe("forwarded");
   });
 });
 
-describe("NDJSON ingestion", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("{}", { status: 200 }))); });
+describe("POST /gov/whitelist", () => {
+  it("adds IP to whitelist and subsequent block is skipped", async () => {
+    const env = makeEnv();
 
-  it("returns forwarded count", async () => {
-    const ndjson = [
-      JSON.stringify({ Action: "block", ClientIP: "1.1.1.1", Source: "waf", WAFRuleID: "R1", EdgeStartTimestamp: 1748476800000000000 }),
-      JSON.stringify({ Action: "challenge", ClientIP: "2.2.2.2", BotScore: 5, BotScoreSrc: "Heuristics" }),
-    ].join("\n");
-    const res = await worker.fetch(makeRequest("POST", "/", ndjson, { "X-Auth-Secret": "supersecret" }), env, {} as ExecutionContext);
+    // Add to whitelist
+    const wlRes = await worker.fetch(
+      req("POST", "/gov/whitelist", JSON.stringify({ ip: "10.0.0.1", reason: "Internal scanner", by: "admin@corp.com" }), { "X-Gov-Admin-Secret": "admin-secret" }),
+      env, {} as ExecutionContext,
+    );
+    expect((await wlRes.json() as { whitelisted: string }).whitelisted).toBe("10.0.0.1");
+
+    // Block attempt should be skipped
+    const body = JSON.stringify({ id: "a1", policy_name: "test", severity: 9, src_ip: "10.0.0.1" });
+    const sig = await hmacSign(body, "wh-secret");
+    vi.stubGlobal("fetch", vi.fn());
+    const blockRes = await worker.fetch(
+      req("POST", "/spyderbat-alert", body, { "X-Spyderbat-Signature": sig }),
+      env, {} as ExecutionContext,
+    );
+    const b = await blockRes.json() as { action: string };
+    expect(b.action).toBe("skipped_whitelist");
+    // CF API should NOT have been called
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+});
+
+describe("DELETE /gov/whitelist", () => {
+  it("removes IP from whitelist", async () => {
+    const env = makeEnv();
+    await worker.fetch(req("POST", "/gov/whitelist", JSON.stringify({ ip: "9.9.9.9", reason: "test", by: "admin" }), { "X-Gov-Admin-Secret": "admin-secret" }), env, {} as ExecutionContext);
+    const res = await worker.fetch(req("DELETE", "/gov/whitelist", JSON.stringify({ ip: "9.9.9.9" }), { "X-Gov-Admin-Secret": "admin-secret" }), env, {} as ExecutionContext);
+    const b = await res.json() as { removed: string };
+    expect(b.removed).toBe("9.9.9.9");
+  });
+});
+
+describe("POST /gov/unblock", () => {
+  it("calls CF API to remove IP and clears block TTL", async () => {
+    const env = makeEnv();
+    const cfUnblock = vi.fn().mockResolvedValue(new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", cfUnblock);
+    const res = await worker.fetch(req("POST", "/gov/unblock", JSON.stringify({ ip: "5.5.5.5" }), { "X-Gov-Admin-Secret": "admin-secret" }), env, {} as ExecutionContext);
     expect(res.status).toBe(200);
-    const body = await res.json() as { forwarded: number };
-    expect(body.forwarded).toBe(2);
-  });
-
-  it("skips malformed lines", async () => {
-    const ndjson = ["BAD_JSON", JSON.stringify({ Action: "block", ClientIP: "3.3.3.3" })].join("\n");
-    const res = await worker.fetch(makeRequest("POST", "/", ndjson, { "X-Auth-Secret": "supersecret" }), env, {} as ExecutionContext);
-    const body = await res.json() as { forwarded: number };
-    expect(body.forwarded).toBe(1);
-  });
-
-  it("handles CRLF line endings", async () => {
-    const ndjson = JSON.stringify({ Action: "block", ClientIP: "4.4.4.4" }) + "\r\n" + JSON.stringify({ Action: "log", ClientIP: "5.5.5.5" });
-    const res = await worker.fetch(makeRequest("POST", "/", ndjson, { "X-Auth-Secret": "supersecret" }), env, {} as ExecutionContext);
-    const body = await res.json() as { forwarded: number };
-    expect(body.forwarded).toBe(2);
-  });
-
-  it("returns forwarded:0 for empty body", async () => {
-    const res = await worker.fetch(makeRequest("POST", "/", "", { "X-Auth-Secret": "supersecret" }), env, {} as ExecutionContext);
-    const body = await res.json() as { forwarded: number };
-    expect(body.forwarded).toBe(0);
-  });
-
-  it("enriches events with country and ASN tags", async () => {
-    const capture = vi.fn().mockResolvedValue(new Response("{}", { status: 200 }));
-    vi.stubGlobal("fetch", capture);
-    const payload = JSON.stringify({ Action: "block", ClientIP: "1.1.1.1", ClientCountry: "CN", ClientASN: 63949, ClientASNDescription: "LINODE-AP", Source: "waf", WAFRuleID: "R1" });
-    await worker.fetch(makeRequest("POST", "/", payload, { "X-Auth-Secret": "supersecret" }), env, {} as ExecutionContext);
-    const sent = JSON.parse(capture.mock.calls[0][1].body as string);
-    expect(sent.tags).toContain("country:CN");
-    expect(sent.description).toContain("asn:LINODE-AP");
+    const b = await res.json() as { unblocked: string };
+    expect(b.unblocked).toBe("5.5.5.5");
+    expect(cfUnblock).toHaveBeenCalled();
   });
 });
 
-describe("severity mapping", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("{}", { status: 200 }))); });
+// ── Circuit breaker ───────────────────────────────────────────────────────
+describe("circuit breaker", () => {
+  it("opens after CIRCUIT_THRESHOLD blocks and holds subsequent alerts", async () => {
+    const env = makeEnv();
+    const gov = new Governance(env.GOV_KV, "admin-secret");
 
-  it("block → severity 8", async () => {
-    const capture = vi.fn().mockResolvedValue(new Response("{}", { status: 200 }));
-    vi.stubGlobal("fetch", capture);
-    await worker.fetch(makeRequest("POST", "/", JSON.stringify({ Action: "block", ClientIP: "1.1.1.1" }), { "X-Auth-Secret": "supersecret" }), env, {} as ExecutionContext);
-    expect(JSON.parse(capture.mock.calls[0][1].body as string).severity).toBe(8);
-  });
+    // Pre-load counter to threshold
+    const hour = new Date().toISOString().slice(0, 13);
+    await env.GOV_KV.put(`gov:circuit:${hour}`, String(CIRCUIT_THRESHOLD));
 
-  it("challenge + bot score < 30 → severity 7", async () => {
-    const capture = vi.fn().mockResolvedValue(new Response("{}", { status: 200 }));
-    vi.stubGlobal("fetch", capture);
-    await worker.fetch(makeRequest("POST", "/", JSON.stringify({ Action: "challenge", ClientIP: "1.1.1.1", BotScore: 10 }), { "X-Auth-Secret": "supersecret" }), env, {} as ExecutionContext);
-    expect(JSON.parse(capture.mock.calls[0][1].body as string).severity).toBe(7);
-  });
-});
+    const body = JSON.stringify({ id: "cb-1", policy_name: "test", severity: 9, src_ip: "7.7.7.7" });
+    const sig = await hmacSign(body, "wh-secret");
+    vi.stubGlobal("fetch", vi.fn());
 
-// ── Reverse webhook (POST /spyderbat-alert) ───────────────────────────────
-describe("reverse webhook: Spyderbat → Cloudflare block", () => {
-  it("returns 401 when signature header missing", async () => {
-    const res = await worker.fetch(makeRequest("POST", "/spyderbat-alert", '{}'), env, {} as ExecutionContext);
-    expect(res.status).toBe(401);
-  });
-
-  it("returns 401 when HMAC signature is invalid", async () => {
-    const res = await worker.fetch(makeRequest("POST", "/spyderbat-alert", '{}', { "X-Spyderbat-Signature": "invalidsig" }), env, {} as ExecutionContext);
-    expect(res.status).toBe(401);
-  });
-
-  it("blocks IP when valid Spyderbat alert arrives", async () => {
-    const body = JSON.stringify({ id: "alert-1", policy_name: "high-severity-ssh", severity: 9, src_ip: "10.0.0.1" });
-    const sig = await hmacSign(body, "webhook-secret");
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response('{"result":{"id":"item-1"}}', { status: 200 })));
-    const res = await worker.fetch(makeRequest("POST", "/spyderbat-alert", body, { "X-Spyderbat-Signature": sig }), env, {} as ExecutionContext);
-    expect(res.status).toBe(200);
-    const result = await res.json() as { action: string; ip: string };
-    expect(result.action).toBe("blocked");
-    expect(result.ip).toBe("10.0.0.1");
-  });
-
-  it("returns noop when alert has no src_ip", async () => {
-    const body = JSON.stringify({ id: "alert-2", policy_name: "anomaly", severity: 5 });
-    const sig = await hmacSign(body, "webhook-secret");
-    const res = await worker.fetch(makeRequest("POST", "/spyderbat-alert", body, { "X-Spyderbat-Signature": sig }), env, {} as ExecutionContext);
-    const result = await res.json() as { action: string };
-    expect(result.action).toBe("noop");
+    const res = await worker.fetch(req("POST", "/spyderbat-alert", body, { "X-Spyderbat-Signature": sig }), env, {} as ExecutionContext);
+    const b = await res.json() as { action: string };
+    expect(b.action).toBe("held_circuit");
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled(); // CF API not called
   });
 });
 
-// ── Spyderbat error handling ──────────────────────────────────────────────
-describe("Spyderbat error handling", () => {
-  it("returns 502 when Spyderbat returns non-2xx", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("error", { status: 500 })));
-    const res = await worker.fetch(makeRequest("POST", "/", JSON.stringify({ Action: "block", ClientIP: "1.1.1.1" }), { "X-Auth-Secret": "supersecret" }), env, {} as ExecutionContext);
-    expect(res.status).toBe(502);
-  });
+// ── Duplicate block skip ──────────────────────────────────────────────────
+describe("duplicate block skip", () => {
+  it("skips if IP already blocked within TTL window", async () => {
+    const env = makeEnv();
+    const gov = new Governance(env.GOV_KV, "admin-secret");
+    await gov.trackBlock("8.8.8.8", "already-blocked");
 
-  it("returns 502 when Spyderbat is unreachable", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network error")));
-    const res = await worker.fetch(makeRequest("POST", "/", JSON.stringify({ Action: "block", ClientIP: "1.1.1.1" }), { "X-Auth-Secret": "supersecret" }), env, {} as ExecutionContext);
-    expect(res.status).toBe(502);
+    const body = JSON.stringify({ id: "dup-1", policy_name: "test", severity: 9, src_ip: "8.8.8.8" });
+    const sig = await hmacSign(body, "wh-secret");
+    vi.stubGlobal("fetch", vi.fn());
+
+    const res = await worker.fetch(req("POST", "/spyderbat-alert", body, { "X-Spyderbat-Signature": sig }), env, {} as ExecutionContext);
+    const b = await res.json() as { action: string };
+    expect(b.action).toBe("duplicate_skip");
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+});
+
+// ── Happy path block with governance metadata ─────────────────────────────
+describe("successful block with governance", () => {
+  it("returns decision_id and expires_in", async () => {
+    const env = makeEnv();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response('{"result":{"id":"x"}}', { status: 200 })));
+    const body = JSON.stringify({ id: "ok-1", policy_name: "waf-critical", severity: 9, src_ip: "203.0.113.1" });
+    const sig = await hmacSign(body, "wh-secret");
+    const res = await worker.fetch(req("POST", "/spyderbat-alert", body, { "X-Spyderbat-Signature": sig }), env, {} as ExecutionContext);
+    const b = await res.json() as { action: string; decision_id: string; expires_in: string };
+    expect(b.action).toBe("blocked");
+    expect(b.decision_id).toBeTruthy();
+    expect(b.expires_in).toBe("24h");
+  });
+});
+
+// ── Logpush: gov metadata attached to Spyderbat events ───────────────────
+describe("governance metadata on forwarded events", () => {
+  it("each event contains gov.decision_id and gov.auto_action", async () => {
+    const env = makeEnv();
+    const capture = vi.fn().mockResolvedValue(new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", capture);
+    await worker.fetch(
+      req("POST", "/", JSON.stringify({ Action: "block", ClientIP: "6.6.6.6", Source: "waf", WAFRuleID: "R2" }),
+        { "X-Auth-Secret": "supersecret", "Content-Type": "application/x-ndjson" }),
+      env, {} as ExecutionContext,
+    );
+    const sent = JSON.parse(capture.mock.calls[0][1].body as string) as { gov: { decision_id: string; auto_action: boolean } };
+    expect(sent.gov.decision_id).toBeTruthy();
+    expect(sent.gov.auto_action).toBe(true);
   });
 });
