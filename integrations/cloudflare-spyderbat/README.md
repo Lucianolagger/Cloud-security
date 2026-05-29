@@ -1,6 +1,61 @@
 # Cloudflare → Spyderbat Security Event Worker
 
-A Cloudflare Worker that receives security events from Cloudflare Logpush (WAF, Bot, DDoS, Firewall) and forwards them to Spyderbat in real time for correlation and policy monitoring.
+A Cloudflare Worker that receives security events from Cloudflare Logpush (WAF, Bot, DDoS, Firewall, Shadow AI) and forwards them to Spyderbat in real time — with a full **AI Governance layer** controlling every automated action.
+
+---
+
+## Project Status
+
+| Component | Status | Blocker / Notes |
+|---|---|---|
+| Cloudflare → Spyderbat: WAF, Bot, DDoS, Firewall | **READY** | Needs deploy |
+| Shadow AI detection via AI Gateway (cron / 5 min) | **READY** | Needs `CF_AI_GATEWAY_ID` |
+| Reverse: Spyderbat alert → Cloudflare IP block | **READY** | Needs `SPYDERBAT_WEBHOOK_SECRET` |
+| **AI Governance** (circuit breaker + whitelist + audit log) | **READY** | Needs `GOV_ADMIN_SECRET` + KV namespace |
+| Governance admin endpoints (`/gov/*`) | **READY** | Needs `GOV_ADMIN_SECRET` |
+| Unit tests | **12 / 12 passing** | — |
+| Production deploy | **PENDING** | Collect stakeholder data first |
+| Cloudflare Logpush job configured | **PENDING** | Needs `CF_IP_LIST_ID` + `AUTH_SECRET` |
+| Spyderbat Policy webhook configured | **PENDING** | Needs `SPYDERBAT_WEBHOOK_SECRET` |
+| AI Gateway routing in use by org | **PENDING** | Needs `CF_AI_GATEWAY_ID` + developer onboarding |
+
+> **Next step:** each stakeholder fills out their section in [DATA_REQUIREMENTS.md](./DATA_REQUIREMENTS.md), then run `wrangler deploy`.
+
+---
+
+## AI Governance Model
+
+Every automated action in this system passes through a **governance gate** before execution:
+
+```
+Spyderbat alert received
+        │
+        ▼
+  ┌─── Is the IP whitelisted? ─────────────── YES → skipped_whitelist (logged)
+  │
+  ├─── Is the IP already blocked (24h TTL)? ─ YES → duplicate_skip (logged)
+  │
+  ├─── Is circuit breaker OPEN? ─────────────────────────────────────────────
+  │    (> 50 auto-blocks in current hour)     YES → held_circuit (logged)
+  │                                                → human review required
+  │                                                → check /gov/audit
+  ▼
+APPROVED → block IP in Cloudflare → track TTL → log decision → return decision_id
+```
+
+| Governance control | Default | Who can change |
+|---|---|---|
+| Circuit breaker threshold | **50 blocks / hour** | Security Team via code |
+| Block auto-expiry | **24 hours** | Security Team via code |
+| Auto-block severity floor | **7 / 10** | Security Team via Spyderbat Policy |
+| IP Whitelist | Empty | **Security Team** via `POST /gov/whitelist` |
+| Manual unblock | — | **Security Team** via `POST /gov/unblock` |
+| Audit log retention | **30 days** | KV TTL in governance.ts |
+
+**Every event forwarded to Spyderbat carries:**
+`gov.decision_id` · `gov.reviewed` · `gov.auto_action` · `gov.circuit_count`
+
+---
 
 ## Architecture
 

@@ -28,7 +28,8 @@ crons = ["*/5 * * * *"]
 # Then paste the id below
 [[kv_namespaces]]
 binding = "GOV_KV"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"          # wrangler kv namespace create GOV_KV  → paste result.id here
+preview_id = "REPLACE_WITH_YOUR_KV_PREVIEW_ID"   # same command shows preview_id for wrangler dev
 
 # ── Secret: GOV_ADMIN_SECRET ──────────────────────────────────────────────
 # wrangler secret put GOV_ADMIN_SECRET
