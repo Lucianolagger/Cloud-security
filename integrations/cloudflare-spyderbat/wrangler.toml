@@ -1,0 +1,18 @@
+name = "cloudflare-spyderbat-worker"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+# ── Secrets (set via CLI — never store values here) ────────────────────────
+# wrangler secret put SPYDERBAT_API_URL
+# wrangler secret put SPYDERBAT_API_TOKEN
+# wrangler secret put SPYDERBAT_ORG_UID
+# wrangler secret put AUTH_SECRET
+
+# ── Route — update zone_name and pattern to match your domain ─────────────
+# [[routes]]
+# pattern = "security-ingest.yourdomain.com/*"
+# zone_name = "yourdomain.com"
+
+# ── Optional: cron trigger to emit a health log every 5 minutes ───────────
+# [triggers]
+# crons = ["*/5 * * * *"]
